@@ -170,19 +170,27 @@ class SimpleJobDef {
   SimpleJobDef({required this.runner});
 
   final SimpleJobRunner runner;
+
+  int errorCount = 0;
+  DateTime? lastError;
 }
 
 class SimpleJobQueue {
-  SimpleJobQueue({this.maxQueueSize = 100});
+  SimpleJobQueue({
+    this.baseExpBackoffSeconds = 10,
+    this.maxRetries = 3,
+    Future<void> Function(Duration)? delayFunction,
+  }) : _delayFunction = delayFunction ?? Future.delayed;
 
-  final int maxQueueSize;
+  final int baseExpBackoffSeconds;
+  final int maxRetries;
+
+  final Future<void> Function(Duration) _delayFunction;
 
   final Queue<SimpleJobDef> _queue = Queue<SimpleJobDef>();
 
-  StreamSubscription<SimpleJobDef>? _currentStream;
-
-  int _errorCount = 0;
-  DateTime? _lastError;
+  @visibleForTesting
+  Queue<SimpleJobDef> get queue => _queue;
 
   @visibleForTesting
   int get length => _queue.length;
@@ -191,62 +199,93 @@ class SimpleJobQueue {
     _queue.addLast(job);
   }
 
-  Future<int> triggerJobRuns() {
-    if (_currentStream != null) {
-      _logger.info('Already running jobs. Ignoring trigger.');
-      return Future.value(0);
-    }
+  Future<int> triggerJobRuns() async {
     _logger.finest('Triggering Job Runs. ${_queue.length}');
-    final completer = Completer<int>();
     var successfulJobs = 0;
-//    final job = _queue.removeFirst();
-    _currentStream = (() async* {
-      final copyQueue = _queue.map((job) async {
-        await job.runner(job).drain(null);
-        return job;
-      }).toList(growable: false);
-      for (final job in copyQueue) {
-        yield await job;
-      }
-    })()
-        .listen((successJob) {
-      _queue.remove(successJob);
-      successfulJobs++;
-      _logger.finest(
-          'Success job. remaining: ${_queue.length} - completed: $successfulJobs');
-    }, onDone: () {
-      _logger.finest('All jobs done.');
-      _errorCount = 0;
-      _lastError = null;
 
-      _currentStream = null;
-      completer.complete(successfulJobs);
-    }, onError: (Object error, StackTrace stackTrace) {
-      _logger.warning('Error while executing job', error, stackTrace);
-      _errorCount++;
-      _lastError = DateTime.now();
-      _currentStream!.cancel();
-      _currentStream = null;
-      completer.completeError(error, stackTrace);
+    // Make a copy of the queue to avoid modification during iteration
+    final jobsToProcess = List<SimpleJobDef>.from(_queue);
 
-      const errorWait = 10;
-      final minWait =
-          Duration(seconds: errorWait * (_errorCount * _errorCount + 1));
-      if (_lastError!.difference(DateTime.now()).abs().compareTo(minWait) < 0) {
-        _logger.finest('There was an error. waiting at least $minWait');
-        if (_queue.length > maxQueueSize) {
-          _logger.finest('clearing log buffer. ${_queue.length}');
-          _queue.clear();
+    for (final job in jobsToProcess) {
+      // Implement per-job backoff strategy before processing
+      if (job.errorCount > 0) {
+        final backoffDuration = Duration(
+            seconds:
+                baseExpBackoffSeconds * (job.errorCount * job.errorCount + 1));
+
+        final timeSinceLastError =
+            DateTime.now().difference(job.lastError ?? DateTime.now());
+        if (timeSinceLastError < backoffDuration) {
+          final waitDuration = backoffDuration - timeSinceLastError;
+          _logger.finest(
+              'Job is backing off for ${waitDuration.inSeconds} seconds before retrying.');
+          await _delayFunction(waitDuration);
         }
       }
-      return Future.value(null);
-    });
 
-    return completer.future;
-  }
+      try {
+        // Execute the job
+        await job.runner(job).drain(null);
 
-  void dispose() {
-    _currentStream?.cancel();
-    _currentStream = null;
+        // If successful, remove the job from the queue
+        _queue.remove(job);
+        successfulJobs++;
+        _logger.finest(
+            'Success job. Remaining: ${_queue.length}, Completed: $successfulJobs');
+
+        // Reset job's error count and last error time
+        job.errorCount = 0;
+        job.lastError = null;
+      } catch (error, stackTrace) {
+        // Handle error per job
+        _logger.warning('Error while executing job', error, stackTrace);
+
+        bool shouldRetry = false;
+
+        // Decide whether to retry based on error
+        if (error is DioException) {
+          if (error.type == DioExceptionType.connectionError ||
+              error.type == DioExceptionType.sendTimeout ||
+              error.type == DioExceptionType.receiveTimeout ||
+              error.type == DioExceptionType.cancel) {
+            // Network error, we can retry
+            shouldRetry = true;
+          } else if (error.type == DioExceptionType.badResponse) {
+            // HTTP error, check status code
+            final statusCode = error.response?.statusCode;
+            if (statusCode != null && statusCode <= 500) {
+              // Bad request or server error, do not retry
+              shouldRetry = false;
+            } else {
+              // Retry on errors > 500
+              shouldRetry = true;
+            }
+          }
+        }
+
+        if (!shouldRetry) {
+          // Remove the job from the queue, since we don't want to retry
+          _queue.remove(job);
+          _logger.warning(
+              'Removing job from queue due to non-retryable error (HTTP ${error is DioException ? error.response?.statusCode : 'unknown'}).');
+        } else {
+          // Update job's error count and last error time
+          job.errorCount++;
+          job.lastError = DateTime.now();
+
+          // Check if job has reached max retries
+          if (job.errorCount >= maxRetries) {
+            _logger.warning(
+                'Job has reached maximum retries ($maxRetries). Removing from queue.');
+            _queue.remove(job);
+          } else {
+            _logger.info(
+                'Keeping job in queue for retry. Error count: ${job.errorCount}');
+          }
+        }
+      }
+    }
+
+    return successfulJobs;
   }
 }
