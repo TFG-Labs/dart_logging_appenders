@@ -37,7 +37,7 @@ void main() {
       final maxRetries = 3;
       final queue = SimpleJobQueue(
         maxRetries: maxRetries,
-        baseWaitSeconds: 1,
+        baseExpBackoffSeconds: 1,
         delayFunction: (_) => Future.value(), // Mock delay function
       );
 
@@ -155,7 +155,7 @@ void main() {
     });
 
     test('Backoff is applied per job for retryable errors', () async {
-      final queue = SimpleJobQueue(baseWaitSeconds: 1);
+      final queue = SimpleJobQueue(baseExpBackoffSeconds: 1);
 
       var runCount = 0;
 
@@ -199,7 +199,7 @@ void main() {
       final maxRetries = 3;
       final queue = SimpleJobQueue(
         maxRetries: maxRetries,
-        baseWaitSeconds: 1,
+        baseExpBackoffSeconds: 1,
         delayFunction: (_) => Future.value(), // Mock delay function
       );
 

@@ -177,12 +177,12 @@ class SimpleJobDef {
 
 class SimpleJobQueue {
   SimpleJobQueue({
-    this.baseWaitSeconds = 10,
-    this.maxRetries = 5,
+    this.baseExpBackoffSeconds = 10,
+    this.maxRetries = 3,
     Future<void> Function(Duration)? delayFunction,
   }) : _delayFunction = delayFunction ?? Future.delayed;
 
-  final int baseWaitSeconds;
+  final int baseExpBackoffSeconds;
   final int maxRetries;
 
   final Future<void> Function(Duration) _delayFunction;
@@ -210,7 +210,8 @@ class SimpleJobQueue {
       // Implement per-job backoff strategy before processing
       if (job.errorCount > 0) {
         final backoffDuration = Duration(
-            seconds: baseWaitSeconds * (job.errorCount * job.errorCount + 1));
+            seconds:
+                baseExpBackoffSeconds * (job.errorCount * job.errorCount + 1));
 
         final timeSinceLastError =
             DateTime.now().difference(job.lastError ?? DateTime.now());
